@@ -1,39 +1,33 @@
-//! 极简 DNS SRV 查询（v3：DoH 优先，UDP 兜底）。
+//! 极简 DNS SRV 查询（v3b：明文 HTTP 版 DoH，纯 std，不用 reqwest）。
 //!
-//! 为什么从 v2 的「纯 UDP 53」改成「HTTPS DoH」：
-//!   v2 实测在手机上两个网络（家里 WiFi、蜂窝）都拿不到 SRV 结果，
-//!   而同一个域名带端口直连是通的 —— 说明不是 DNS 记录的问题，
-//!   是「向 223.5.5.5:53 发裸 UDP」这条路在手机网络里被拦/被劫持了。
-//!   DoH 走 443，和浏览器访问网页同一条路，拦不住。
+//! 演进过程：
+//!   v1/v2：向 223.5.5.5:53 发裸 UDP —— 实测在手机上（WiFi 和蜂窝）都被拦，拿不到结果。
+//!   v3   ：用 reqwest 走 HTTPS DoH —— 逻辑对，但主 crate 之前从没真正用过 reqwest，
+//!          在 Android 上编译踩坑，CI 的 Build rustdesk lib 失败。
+//!   v3b  ：改用「明文 HTTP 的 DoH」（http://223.5.5.5/resolve?...&type=SRV），
+//!          只用 std 的 TcpStream 手写一个 HTTP/1.1 GET，零依赖、零 TLS，
+//!          和 v2 一样只依赖标准库 —— v2 能编过，v3b 就能编过。
 //!
-//! 依赖：reqwest（主 crate 已有直接依赖，features 含 rustls-tls + json）
-//!       serde_json（同样已有）
-//!   ⇒ 不新增依赖，不动 Cargo.lock，CI 的 --locked 不受影响。
+//! 端点实测可用（返回 JSON，含 "data":"10 5 33183 866601.xyz."）：
+//!   http://223.5.5.5/resolve?name=...&type=SRV
+//!   http://dns.alidns.com/resolve?name=...&type=SRV
 
-use std::net::UdpSocket;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const DOH_TIMEOUT: Duration = Duration::from_millis(2500);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 const UDP_TIMEOUT: Duration = Duration::from_millis(1200);
 
-/// DoH 端点，按顺序尝试。前两个国内必达，第三个只在境外网络有意义。
-const DOH_ENDPOINTS: &[&str] = &[
-    // 域名端点：走系统 DNS 解析（实测手机系统 DNS 是好的，A 记录能正常解析）
-    "https://dns.alidns.com/resolve",
-    // IP 端点：完全绕开 DNS，证书含 IP SAN
-    "https://223.5.5.5/resolve",
+/// (Host 头, 连接地址)
+const HTTP_ENDPOINTS: &[(&str, &str)] = &[
+    ("223.5.5.5", "223.5.5.5:80"),          // 纯 IP，不依赖系统 DNS
+    ("dns.alidns.com", "dns.alidns.com:80"), // 域名，走系统 DNS
 ];
 
-/// UDP 兜底用的 DNS 服务器
-const DNS_SERVERS: &[&str] = &[
-    "223.5.5.5:53",
-    "119.29.29.29:53",
-    "114.114.114.114:53",
-];
+const DNS_SERVERS: &[&str] = &["223.5.5.5:53", "119.29.29.29:53"];
 
-/// 判断这个 peer 字符串是否需要走 SRV 解析。
-///
-/// 只认「裸域名」这一种：排除 IP、排除 域名:端口、排除纯数字 ID。
+/// 判断这个 peer 字符串是否需要走 SRV 解析（只认裸域名）。
 pub fn needs_srv(peer: &str) -> bool {
     !peer.is_empty()
         && !hbb_common::is_ip_str(peer)
@@ -44,71 +38,81 @@ pub fn needs_srv(peer: &str) -> bool {
 
 /// 把裸域名解析成 "target:port"。解析不出来返回 None（调用方用原值继续）。
 ///
-/// 返回的是「域名:端口」形态 —— RustDesk 原生支持的输入格式，
-/// 下游所有逻辑都会当成普通直连处理，和用户手输 IP:端口 完全同一条路径。
+/// 保持 async 签名，是为了不修改 client.rs 里已经写好的 `.await`。
+/// 内部是同步 IO，但只在建立连接时调一次，耗时很短。
 pub async fn resolve_peer(peer: &str) -> Option<String> {
     let name = format!("_rustdesk._tcp.{}", peer.trim_end_matches('.'));
+    let path = format!("/resolve?name={}&type=SRV", name);
 
-    // 1) DoH over HTTPS —— 走 443，最可靠
-    for base in DOH_ENDPOINTS {
-        match doh_lookup(base, &name).await {
-            Some(addr) => {
-                log::info!("SRV(DoH) {} -> {} via {}", name, addr, base);
-                return Some(addr);
+    // 1) 明文 HTTP 版 DoH
+    for (host, addr) in HTTP_ENDPOINTS {
+        if let Some(body) = http_get(host, addr, &path) {
+            if let Some(addr_str) = parse_srv_json(&body) {
+                log::info!("SRV(HTTP) {} -> {} via {}", name, addr_str, host);
+                return Some(addr_str);
             }
-            None => continue,
         }
     }
-    log::warn!("SRV: DoH 全部失败，回退到 UDP 53");
+    log::warn!("SRV: HTTP DoH 失败，回退到 UDP 53");
 
     // 2) 兜底：原始 UDP 53
     if let Some(recs) = lookup_srv(&name) {
         if let Some((_, target, port)) = recs.into_iter().next() {
             if port != 0 && !target.is_empty() {
-                let addr = format!("{}:{}", target.trim_end_matches('.'), port);
-                log::info!("SRV(UDP) {} -> {}", name, addr);
-                return Some(addr);
+                let s = format!("{}:{}", target.trim_end_matches('.'), port);
+                log::info!("SRV(UDP) {} -> {}", name, s);
+                return Some(s);
             }
         }
     }
     None
 }
 
-/// 用 DNS-over-HTTPS 查一条 SRV 记录，返回 "target:port"。
-async fn doh_lookup(base: &str, name: &str) -> Option<String> {
-    let url = format!("{}?name={}&type=SRV", base, name);
-    let cli = reqwest::Client::builder()
-        .timeout(DOH_TIMEOUT)
-        .build()
-        .ok()?;
-    let resp = cli
-        .get(&url)
-        .header("Accept", "application/dns-json")
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
+/// 手写一个最小的 HTTP/1.1 GET，返回响应体。
+fn http_get(host: &str, addr: &str, path: &str) -> Option<String> {
+    let sock_addr = addr.to_socket_addrs().ok()?.next()?;
+    let mut s = TcpStream::connect_timeout(&sock_addr, HTTP_TIMEOUT).ok()?;
+    s.set_read_timeout(Some(HTTP_TIMEOUT)).ok()?;
+    s.set_write_timeout(Some(HTTP_TIMEOUT)).ok()?;
+
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: application/dns-json\r\nUser-Agent: rustdesk\r\nConnection: close\r\n\r\n",
+        path, host
+    );
+    s.write_all(req.as_bytes()).ok()?;
+
+    let mut buf = Vec::with_capacity(2048);
+    s.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+
+    // 跳过响应头，取 body
+    let idx = text.find("\r\n\r\n")?;
+    let body = &text[idx + 4..];
+    if !body.contains("\"Answer\"") {
         return None;
     }
-    let text = resp.text().await.ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let answers = v.get("Answer")?.as_array()?;
+    Some(body.to_string())
+}
 
+/// 从 DoH 的 JSON 里挑出优先级最高的 SRV，返回 "target:port"。
+///
+/// 不引 serde_json，直接扫 `"data":"..."`——这个接口的 Answer 项结构固定，
+/// 且 Question 段里不含 data 字段，所以扫描到的一定是答案记录。
+fn parse_srv_json(body: &str) -> Option<String> {
     let mut best: Option<(u64, String)> = None;
-    for a in answers {
-        let rtype = match a.get("type").and_then(|x| x.as_u64()) {
-            Some(t) => t,
-            None => continue,
+    let mut rest = body;
+
+    while let Some(pos) = rest.find("\"data\":\"") {
+        rest = &rest[pos + 8..];
+        let end = match rest.find('"') {
+            Some(e) => e,
+            None => break,
         };
-        if rtype != 33 {
-            continue;
-        }
-        let data = match a.get("data").and_then(|x| x.as_str()) {
-            Some(d) => d,
-            None => continue,
-        };
-        // DoH 返回的 data 形如 "10 5 33183 866601.xyz."
-        let parts: Vec<&str> = data.split_whitespace().collect();
+        let val = &rest[..end];
+        rest = &rest[end..];
+
+        // 形如 "10 5 33183 866601.xyz."
+        let parts: Vec<&str> = val.split_whitespace().collect();
         if parts.len() < 4 {
             continue;
         }
@@ -124,13 +128,13 @@ async fn doh_lookup(base: &str, name: &str) -> Option<String> {
         if port == 0 || target.is_empty() {
             continue;
         }
-        let addr = format!("{}:{}", target, port);
+        let s = format!("{}:{}", target, port);
         match &best {
             Some((p, _)) if *p <= prio => {}
-            _ => best = Some((prio, addr)),
+            _ => best = Some((prio, s)),
         }
     }
-    best.map(|(_, a)| a)
+    best.map(|(_, s)| s)
 }
 
 // ---------------------------------------------------------------------------
