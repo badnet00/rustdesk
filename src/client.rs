@@ -391,7 +391,7 @@ impl Client {
                 // —— SRV：把裸域名改写成 "target:port"，让下游走上游原生直连逻辑 ——
         let srv_peer;
         let peer = if crate::srv::needs_srv(peer) {
-            match crate::srv::resolve_peer(peer) {
+            match crate::srv::resolve_peer(peer).await {
                 Some(addr) => {
                     log::info!("SRV resolved: {} -> {}", peer, addr);
                     srv_peer = addr;
