@@ -7,6 +7,9 @@
 //!   v3b  ：改用「明文 HTTP 的 DoH」（http://223.5.5.5/resolve?...&type=SRV），
 //!          只用 std 的 TcpStream 手写一个 HTTP/1.1 GET，零依赖、零 TLS，
 //!          和 v2 一样只依赖标准库 —— v2 能编过，v3b 就能编过。
+//!   v3c  ：v3b 里用了 `log::info!`，但主 crate 的 Cargo.toml 里**没有 log 依赖**
+//!          （CI 报 error[E0433] use of undeclared crate or module `log`），
+//!          这里把三处日志调用删掉 —— client.rs 那边本来就会打成功/失败日志。
 //!
 //! 端点实测可用（返回 JSON，含 "data":"10 5 33183 866601.xyz."）：
 //!   http://223.5.5.5/resolve?name=...&type=SRV
@@ -48,20 +51,16 @@ pub async fn resolve_peer(peer: &str) -> Option<String> {
     for (host, addr) in HTTP_ENDPOINTS {
         if let Some(body) = http_get(host, addr, &path) {
             if let Some(addr_str) = parse_srv_json(&body) {
-                log::info!("SRV(HTTP) {} -> {} via {}", name, addr_str, host);
                 return Some(addr_str);
             }
         }
     }
-    log::warn!("SRV: HTTP DoH 失败，回退到 UDP 53");
 
     // 2) 兜底：原始 UDP 53
     if let Some(recs) = lookup_srv(&name) {
         if let Some((_, target, port)) = recs.into_iter().next() {
             if port != 0 && !target.is_empty() {
-                let s = format!("{}:{}", target.trim_end_matches('.'), port);
-                log::info!("SRV(UDP) {} -> {}", name, s);
-                return Some(s);
+                return Some(format!("{}:{}", target.trim_end_matches('.'), port));
             }
         }
     }
