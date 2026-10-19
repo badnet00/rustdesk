@@ -464,6 +464,35 @@ impl Client {
             ));
         }
 
+        // —— SRV: 裸域名（不带端口）→ 查 _rustdesk._tcp.<域名> ——
+        // RustDesk 原本只认「纯 IP」和「域名:端口」，裸域名会掉进
+        // 「当设备 ID 去问服务器」的分支，所以直接填域名必然失败。
+        // 这里补一条：查不到 SRV 就原样往下走，完全不影响原有逻辑。
+        if !hbb_common::is_ip_str(peer)
+            && !hbb_common::is_domain_port_str(peer)
+            && peer.contains('.')
+            && peer.parse::<u32>().is_err()
+        {
+            let srv_name = format!("_rustdesk._tcp.{}", peer);
+            if let Some(recs) = crate::srv::lookup_srv(&srv_name) {
+                if let Some((_, target, port)) = recs.into_iter().next() {
+                    let addr = format!("{}:{}", target, port);
+                    log::info!("SRV {} -> {}", srv_name, addr);
+                    return Ok((
+                        (
+                            connect_tcp_local(addr, None, CONNECT_TIMEOUT).await?,
+                            true,
+                            None,
+                            None,
+                            "TCP",
+                        ),
+                        (0, "".to_owned()),
+                        false,
+                    ));
+                }
+            }
+        }
+
         let other_server = interface.get_lch().read().unwrap().other_server.clone();
         let (peer, other_server, key, token) = if let Some((a, b, c)) = other_server.as_ref() {
             (a.as_ref(), b.as_ref(), c.as_ref(), "")
